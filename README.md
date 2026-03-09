@@ -223,6 +223,10 @@ UnrealClaude automatically gathers information about your project:
 - Recent assets
 - Custom CLAUDE.md instructions
 
+### Scripting
+
+<img width="707" height="542" alt="{AB6AC101-4A4C-4607-BFB6-187D49F5E65B}" src="https://github.com/user-attachments/assets/e0c2e398-8fcd-4ac6-ade7-d50870215ec1" />
+
 ### MCP Server
 
 The plugin includes a Model Context Protocol (MCP) server with 20+ tools that expose editor functionality to Claude and external tools. The MCP server runs on port 3000 by default and starts automatically when the editor loads.
@@ -238,8 +242,6 @@ The plugin includes a Model Context Protocol (MCP) server with 20+ tools that ex
 - **Enhanced Input Tools** - Input action and mapping context management
 - **Utility Tools** - Console commands, output log, viewport capture, script execution
 - **Async Task Queue** - Background execution for long-running operations
-
-<img width="707" height="542" alt="{AB6AC101-4A4C-4607-BFB6-187D49F5E65B}" src="https://github.com/user-attachments/assets/e0c2e398-8fcd-4ac6-ade7-d50870215ec1" />
 
 For full MCP tool documentation with parameters, examples, and API details, see [UnrealClaude's MCP Bridge](https://github.com/Natfii/ue5-mcp-bridge) repository.
 
@@ -309,6 +311,9 @@ Run `claude auth login` in a terminal to authenticate.
 ### Responses are slow
 
 Claude Code executes in your project directory and may read files for context. Large projects may have slower initial responses.
+
+You might also have too many global Claude Code plugins enabled (i.e. Superpowers, ralp-loop, context7). The context for those plugins 
+getting injected can cause slowdowns up to 3+ minutes. 
 
 ### Plugin doesn't compile
 
