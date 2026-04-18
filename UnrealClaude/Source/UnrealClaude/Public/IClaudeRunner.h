@@ -155,4 +155,10 @@ public:
 
 	/** Check if the runner is available (CLI installed, etc.) */
 	virtual bool IsAvailable() const = 0;
+
+	/** Seconds elapsed since the last byte was received on the subprocess stdout pipe. Returns 0 when not executing. */
+	virtual double GetSilenceSeconds() const = 0;
+
+	/** True while the silence banner is latched for display in the status bar. */
+	virtual bool IsSilenceWarningActive() const = 0;
 };

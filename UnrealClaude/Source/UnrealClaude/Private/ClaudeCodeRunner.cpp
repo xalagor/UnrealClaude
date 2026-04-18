@@ -1052,6 +1052,36 @@ void FClaudeCodeRunner::Exit()
 	bIsExecuting = false;
 }
 
+double FClaudeCodeRunner::GetSilenceSeconds() const
+{
+	const int64 LastMillis = LastPipeActivityMillis.Load();
+	if (LastMillis == 0)
+	{
+		return 0.0;
+	}
+	const double NowSec = FPlatformTime::Seconds();
+	// LastPipeActivityMillis is stored in FPlatformTime::Seconds() units * 1000.
+	return NowSec - (static_cast<double>(LastMillis) / 1000.0);
+}
+
+bool FClaudeCodeRunner::IsSilenceWarningActive() const
+{
+	return bSilenceBannerLatched.Load();
+}
+
+void FClaudeCodeRunner::RecordPipeActivity()
+{
+	const int64 NowMillis = static_cast<int64>(FPlatformTime::Seconds() * 1000.0);
+	LastPipeActivityMillis.Store(NowMillis);
+	bSilenceBannerLatched.Store(false);
+}
+
+// Stub — replaced in Task 2
+FString FClaudeCodeRunner::BuildHangDiagnostic(double, bool, const FString&, const FString&, int32, int32, int32) { return FString(); }
+
+// Stub — replaced in Task 3
+bool FClaudeCodeRunner::MaybeFireSilenceWatchdog(double) { return false; }
+
 bool FClaudeCodeRunner::CreateProcessPipes()
 {
 	// Create stdout pipe (we read from ReadPipe, child writes to WritePipe)
@@ -1103,6 +1133,11 @@ bool FClaudeCodeRunner::LaunchProcess(const FString& FullCommand, const FString&
 		return false;
 	}
 
+	// Reset watchdog state for this new subprocess
+	bSilenceBannerLatched.Store(false);
+	bHangDiagnosticLogged.Store(false);
+	LastPipeActivityMillis.Store(static_cast<int64>(FPlatformTime::Seconds() * 1000.0));
+
 	return true;
 }
 
@@ -1121,6 +1156,7 @@ FString FClaudeCodeRunner::ReadProcessOutput()
 
 		if (!OutputChunk.IsEmpty())
 		{
+			RecordPipeActivity();
 			FullOutput += OutputChunk;
 
 			// Parse NDJSON line-by-line: buffer chunks and split on newlines
@@ -1147,6 +1183,7 @@ FString FClaudeCodeRunner::ReadProcessOutput()
 			FString RemainingOutput = FPlatformProcess::ReadPipe(ReadPipe);
 			while (!RemainingOutput.IsEmpty())
 			{
+				RecordPipeActivity();
 				FullOutput += RemainingOutput;
 				NdjsonLineBuffer += RemainingOutput;
 				RemainingOutput = FPlatformProcess::ReadPipe(ReadPipe);
