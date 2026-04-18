@@ -4,6 +4,9 @@
 #include "UnrealClaudeModule.h"
 #include "UnrealClaudeConstants.h"
 #include "ProjectContext.h"
+#include "MCP/UnrealClaudeMCPServer.h"
+#include "MCP/MCPToolRegistry.h"
+#include "MCP/MCPTaskQueue.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
@@ -1052,6 +1055,132 @@ void FClaudeCodeRunner::Exit()
 	bIsExecuting = false;
 }
 
+double FClaudeCodeRunner::GetSilenceSeconds() const
+{
+	const int64 LastMillis = LastPipeActivityMillis.Load();
+	if (LastMillis == 0)
+	{
+		return 0.0;
+	}
+	const double NowSec = FPlatformTime::Seconds();
+	// LastPipeActivityMillis is stored in FPlatformTime::Seconds() units * 1000.
+	return NowSec - (static_cast<double>(LastMillis) / 1000.0);
+}
+
+bool FClaudeCodeRunner::IsSilenceWarningActive() const
+{
+	// Compute from the timestamp directly rather than relying on bSilenceBannerLatched.
+	// The latch is only set by MaybeFireSilenceWatchdog, which runs on the worker thread's
+	// read loop — but the subprocess can hang BEFORE the read loop starts (e.g. stdin
+	// WritePipe blocks when the child isn't reading stdin fast enough). By computing
+	// silence here on every game-thread Slate tick we catch those pre-read-loop hangs too.
+	// LastPipeActivityMillis is seeded in LaunchProcess, so it's valid from process start.
+	if (LastPipeActivityMillis.Load() == 0)
+	{
+		return false;
+	}
+	return GetSilenceSeconds() >= SilenceWarningThresholdSeconds;
+}
+
+void FClaudeCodeRunner::RecordPipeActivity()
+{
+	const int64 NowMillis = static_cast<int64>(FPlatformTime::Seconds() * 1000.0);
+	LastPipeActivityMillis.Store(NowMillis);
+	bSilenceBannerLatched.Store(false);
+}
+
+FString FClaudeCodeRunner::BuildHangDiagnostic(
+	double SilenceSeconds,
+	bool bProcRunning,
+	const FString& StdinPayload,
+	const FString& NdjsonLineBufferSnapshot,
+	int32 TaskQueuePending,
+	int32 TaskQueueRunning,
+	int32 TaskQueueCompleted)
+{
+	auto HeadSlice = [](const FString& S, int32 N) -> FString
+	{
+		return S.Len() <= N ? S : S.Left(N);
+	};
+	auto TailSlice = [](const FString& S, int32 N) -> FString
+	{
+		return S.Len() <= N ? S : S.Right(N);
+	};
+	auto EscapeForSingleLine = [](const FString& S) -> FString
+	{
+		return S.Replace(TEXT("\r"), TEXT("\\r")).Replace(TEXT("\n"), TEXT("\\n"));
+	};
+
+	constexpr int32 PreviewChars = 500;
+	const FString PayloadHead = EscapeForSingleLine(HeadSlice(StdinPayload, PreviewChars));
+	const FString PayloadTail = EscapeForSingleLine(TailSlice(StdinPayload, PreviewChars));
+	const FString BufferTail = EscapeForSingleLine(TailSlice(NdjsonLineBufferSnapshot, PreviewChars));
+
+	return FString::Printf(
+		TEXT("[SilenceWatchdog] silence_sec=%d proc_running=%s payload_bytes=%d buffer_bytes=%d mcp_queue=%d/%d/%d payload_head=\"%s\" payload_tail=\"%s\" buffer_tail=\"%s\""),
+		FMath::FloorToInt(SilenceSeconds),
+		bProcRunning ? TEXT("true") : TEXT("false"),
+		StdinPayload.Len(),
+		NdjsonLineBufferSnapshot.Len(),
+		TaskQueuePending, TaskQueueRunning, TaskQueueCompleted,
+		*PayloadHead, *PayloadTail, *BufferTail);
+}
+
+bool FClaudeCodeRunner::MaybeFireSilenceWatchdog(double NowPlatformSeconds)
+{
+	const int64 LastMillis = LastPipeActivityMillis.Load();
+	if (LastMillis == 0)
+	{
+		// No subprocess activity recorded yet — nothing to evaluate
+		return false;
+	}
+	const double SilenceSec = NowPlatformSeconds - (static_cast<double>(LastMillis) / 1000.0);
+
+	if (SilenceSec < SilenceWarningThresholdSeconds)
+	{
+		return false;
+	}
+
+	// Banner latch: set unconditionally when over threshold. RecordPipeActivity clears it.
+	bSilenceBannerLatched.Store(true);
+
+	// Diagnostic latch: one-shot per session.
+	bool bExpected = false;
+	const bool bWonTheRace = bHangDiagnosticLogged.CompareExchange(bExpected, true);
+	if (!bWonTheRace)
+	{
+		// Diagnostic already logged this session
+		return false;
+	}
+
+	// We won the race — emit the real diagnostic.
+	int32 Pending = 0, Running = 0, Completed = 0;
+	if (FUnrealClaudeModule::IsAvailable())
+	{
+		TSharedPtr<FUnrealClaudeMCPServer> Server = FUnrealClaudeModule::Get().GetMCPServer();
+		if (Server.IsValid())
+		{
+			TSharedPtr<FMCPToolRegistry> Registry = Server->GetToolRegistry();
+			if (Registry.IsValid())
+			{
+				if (TSharedPtr<FMCPTaskQueue> Queue = Registry->GetTaskQueue())
+				{
+					Queue->GetStats(Pending, Running, Completed);
+				}
+			}
+		}
+	}
+
+	const FString Diag = BuildHangDiagnostic(
+		SilenceSec,
+		FPlatformProcess::IsProcRunning(ProcessHandle),
+		LastStdinPayload,
+		NdjsonLineBuffer,
+		Pending, Running, Completed);
+	UE_LOG(LogUnrealClaude, Warning, TEXT("%s"), *Diag);
+	return true;
+}
+
 bool FClaudeCodeRunner::CreateProcessPipes()
 {
 	// Create stdout pipe (we read from ReadPipe, child writes to WritePipe)
@@ -1103,6 +1232,12 @@ bool FClaudeCodeRunner::LaunchProcess(const FString& FullCommand, const FString&
 		return false;
 	}
 
+	// Reset watchdog state for this new subprocess
+	bSilenceBannerLatched.Store(false);
+	bHangDiagnosticLogged.Store(false);
+	LastPipeActivityMillis.Store(static_cast<int64>(FPlatformTime::Seconds() * 1000.0));
+	LastStdinPayload.Empty();
+
 	return true;
 }
 
@@ -1121,6 +1256,7 @@ FString FClaudeCodeRunner::ReadProcessOutput()
 
 		if (!OutputChunk.IsEmpty())
 		{
+			RecordPipeActivity();
 			FullOutput += OutputChunk;
 
 			// Parse NDJSON line-by-line: buffer chunks and split on newlines
@@ -1139,6 +1275,10 @@ FString FClaudeCodeRunner::ReadProcessOutput()
 				}
 			}
 		}
+		else
+		{
+			MaybeFireSilenceWatchdog(FPlatformTime::Seconds());
+		}
 
 		// Check if process has exited
 		if (!FPlatformProcess::IsProcRunning(ProcessHandle))
@@ -1147,6 +1287,7 @@ FString FClaudeCodeRunner::ReadProcessOutput()
 			FString RemainingOutput = FPlatformProcess::ReadPipe(ReadPipe);
 			while (!RemainingOutput.IsEmpty())
 			{
+				RecordPipeActivity();
 				FullOutput += RemainingOutput;
 				NdjsonLineBuffer += RemainingOutput;
 				RemainingOutput = FPlatformProcess::ReadPipe(ReadPipe);
@@ -1172,6 +1313,17 @@ FString FClaudeCodeRunner::ReadProcessOutput()
 			{
 				ParseAndEmitNdjsonLine(NdjsonLineBuffer);
 				NdjsonLineBuffer.Empty();
+			}
+
+			// Clean-exit-no-output: subprocess finished without producing any NDJSON.
+			// This is the "silent crash" path — emit a diagnostic so the user knows why.
+			if (FullOutput.IsEmpty() && !bHangDiagnosticLogged.Load())
+			{
+				// Force-set LastPipeActivityMillis to a value old enough to cross the threshold
+				// so MaybeFireSilenceWatchdog emits the diagnostic with current elapsed time.
+				const double FakeSilenceSec = SilenceWarningThresholdSeconds + 1.0;
+				LastPipeActivityMillis.Store(static_cast<int64>((FPlatformTime::Seconds() - FakeSilenceSec) * 1000.0));
+				MaybeFireSilenceWatchdog(FPlatformTime::Seconds());
 			}
 
 			break;
@@ -1285,6 +1437,8 @@ void FClaudeCodeRunner::ExecuteProcess()
 
 		// Always use stream-json payload (handles text-only and image cases uniformly)
 		FString StdinPayload = BuildStreamJsonPayload(TextPrompt, CurrentConfig.AttachedImagePaths);
+		// Cache the stdin payload for the silence watchdog diagnostic.
+		LastStdinPayload = StdinPayload;
 
 		// Write to stdin
 		if (!StdinPayload.IsEmpty())

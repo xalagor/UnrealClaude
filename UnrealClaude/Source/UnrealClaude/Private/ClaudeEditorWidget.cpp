@@ -538,7 +538,16 @@ FText SClaudeEditorWidget::GetStatusText() const
 {
 	if (bIsWaitingForResponse)
 	{
-		double ElapsedSec = FPlatformTime::Seconds() - StreamingStartTime;
+		const IClaudeRunner* Runner = FClaudeCodeSubsystem::Get().GetRunner();
+		if (Runner && Runner->IsSilenceWarningActive())
+		{
+			const int32 SilenceSec = FMath::FloorToInt(Runner->GetSilenceSeconds());
+			return FText::FromString(FString::Printf(
+				TEXT("⚠ No output from Claude for %ds — may be stuck in Agent SDK. Cancel and retry if this persists."),
+				SilenceSec));
+		}
+
+		const double ElapsedSec = FPlatformTime::Seconds() - StreamingStartTime;
 		FString StatusStr = FString::Printf(TEXT("● Claude is thinking... %.1fs"), ElapsedSec);
 
 		if (StreamingToolCallCount > 0)
@@ -567,6 +576,11 @@ FSlateColor SClaudeEditorWidget::GetStatusColor() const
 {
 	if (bIsWaitingForResponse)
 	{
+		const IClaudeRunner* Runner = FClaudeCodeSubsystem::Get().GetRunner();
+		if (Runner && Runner->IsSilenceWarningActive())
+		{
+			return FSlateColor(FLinearColor(1.0f, 0.5f, 0.0f)); // Orange warning
+		}
 		return FSlateColor(FLinearColor(1.0f, 0.8f, 0.0f)); // Yellow
 	}
 
