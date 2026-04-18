@@ -4,6 +4,9 @@
 #include "UnrealClaudeModule.h"
 #include "UnrealClaudeConstants.h"
 #include "ProjectContext.h"
+#include "MCP/UnrealClaudeMCPServer.h"
+#include "MCP/MCPToolRegistry.h"
+#include "MCP/MCPTaskQueue.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
@@ -1140,14 +1143,31 @@ bool FClaudeCodeRunner::MaybeFireSilenceWatchdog(double NowPlatformSeconds)
 		return false;
 	}
 
-	// We won the race — log the diagnostic. Real wiring to MCP queue + payload snapshot
-	// comes in Task 4; for now pass empty strings / zero counts so the test path works.
+	// We won the race — emit the real diagnostic.
+	int32 Pending = 0, Running = 0, Completed = 0;
+	if (FUnrealClaudeModule::IsAvailable())
+	{
+		TSharedPtr<FUnrealClaudeMCPServer> Server = FUnrealClaudeModule::Get().GetMCPServer();
+		if (Server.IsValid())
+		{
+			TSharedPtr<FMCPToolRegistry> Registry = Server->GetToolRegistry();
+			if (Registry.IsValid())
+			{
+				if (TSharedPtr<FMCPTaskQueue> Queue = Registry->GetTaskQueue())
+				{
+					Queue->GetStats(Pending, Running, Completed);
+				}
+			}
+		}
+	}
+
 	const FString Diag = BuildHangDiagnostic(
 		SilenceSec,
 		FPlatformProcess::IsProcRunning(ProcessHandle),
-		FString(), FString(),
-		0, 0, 0);
-	UE_LOG(LogTemp, Warning, TEXT("%s"), *Diag);
+		LastStdinPayload,
+		NdjsonLineBuffer,
+		Pending, Running, Completed);
+	UE_LOG(LogUnrealClaude, Warning, TEXT("%s"), *Diag);
 	return true;
 }
 
@@ -1244,6 +1264,10 @@ FString FClaudeCodeRunner::ReadProcessOutput()
 				}
 			}
 		}
+		else
+		{
+			MaybeFireSilenceWatchdog(FPlatformTime::Seconds());
+		}
 
 		// Check if process has exited
 		if (!FPlatformProcess::IsProcRunning(ProcessHandle))
@@ -1278,6 +1302,17 @@ FString FClaudeCodeRunner::ReadProcessOutput()
 			{
 				ParseAndEmitNdjsonLine(NdjsonLineBuffer);
 				NdjsonLineBuffer.Empty();
+			}
+
+			// Clean-exit-no-output: subprocess finished without producing any NDJSON.
+			// This is the "silent crash" path — emit a diagnostic so the user knows why.
+			if (FullOutput.IsEmpty() && !bHangDiagnosticLogged.Load())
+			{
+				// Force-set LastPipeActivityMillis to a value old enough to cross the threshold
+				// so MaybeFireSilenceWatchdog emits the diagnostic with current elapsed time.
+				const double FakeSilenceSec = SilenceWarningThresholdSeconds + 1.0;
+				LastPipeActivityMillis.Store(static_cast<int64>((FPlatformTime::Seconds() - FakeSilenceSec) * 1000.0));
+				MaybeFireSilenceWatchdog(FPlatformTime::Seconds());
 			}
 
 			break;
@@ -1391,6 +1426,8 @@ void FClaudeCodeRunner::ExecuteProcess()
 
 		// Always use stream-json payload (handles text-only and image cases uniformly)
 		FString StdinPayload = BuildStreamJsonPayload(TextPrompt, CurrentConfig.AttachedImagePaths);
+		// Cache the stdin payload for the silence watchdog diagnostic.
+		LastStdinPayload = StdinPayload;
 
 		// Write to stdin
 		if (!StdinPayload.IsEmpty())

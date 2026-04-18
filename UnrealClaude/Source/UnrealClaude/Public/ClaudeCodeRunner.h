@@ -64,6 +64,9 @@ private:
 	/** Buffer for accumulating incomplete NDJSON lines across read chunks */
 	FString NdjsonLineBuffer;
 
+	/** Cached stream-json payload last written to stdin; used for watchdog diagnostics. */
+	FString LastStdinPayload;
+
 	/** Accumulated text from assistant messages for the final response */
 	FString AccumulatedResponseText;
 
